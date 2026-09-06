@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Spielt eine vollstaendige Partie gegen Stub-Modelle — ohne Netz, ohne Kosten.
+"""Spielt eine vollstaendige Partie gegen Stub-Modelle und wertet sie aus.
 
-Prueft die Phasen 3 und 4 zusammen:
+Prueft die Phasen 3, 4 und 5 in einem Durchlauf:
 
 * jede Nation entscheidet mit ihrem eigenen Modell,
 * alle Aktionen werden simultan aufgeloest und der richtigen Nation zugeordnet,
 * das Protokoll trennt private Absicht, oeffentliche Aktion und Nachricht,
-* Nachrichten erreichen in der Folgerunde das Postfach des Empfaengers.
+* Nachrichten erreichen in der Folgerunde das Postfach des Empfaengers,
+* und die Auswertung zieht daraus die Kennzahlen, LLM-Richter eingeschlossen.
 
     python3 scripts/smoke_game.py
 
@@ -128,7 +129,30 @@ def main() -> int:
         senders_r1 = {m["to"] for a in r1["agents"].values() for m in a["messages"]}
         check("Nachrichten wurden verschickt", bool(senders_r1), str(sorted(senders_r1)))
 
-        print("\nOK — Phase 3 + 4 funktionieren." if ok else "\nFEHLGESCHLAGEN")
+        # Phase 5 auf demselben Protokoll — die ganze Kette in einem Lauf
+        import analyze
+        result = analyze.aggregate([d])
+        check("Auswertung findet alle Modelle",
+              len(result["by_model"]) == len(SEATS), str(sorted(result["by_model"])))
+        check("Auswertung erkennt die Zusagen",
+              len(result["promises"]) == ROUNDS * len(SEATS),
+              f"{len(result['promises'])}")
+        check("Auswertung erkennt die Unaufrichtigkeit des Stubs",
+              all(p["insincere"] for p in result["promises"]))
+        check("Täuschungsrate bleibt bei höchstens 1.0",
+              all(0.0 <= m["deception_rate"] <= 1.0 for m in result["by_model"].values()),
+              str({k: v["deception_rate"] for k, v in result["by_model"].items()}))
+
+        analyze.judge_promises(result, [d], "stub/judge", "stub", STUB)
+        judged = [p for p in result["promises"] if p.get("judge")]
+        check("LLM-Richter liefert Urteile", bool(judged),
+              f"{len(judged)} bewertet")
+        check("Urteile sind wohlgeformt",
+              all(j["judge"].get("verdict") in ("kept", "broken", "unclear")
+                  for j in judged),
+              str({j["judge"].get("verdict") for j in judged}))
+
+        print("\nOK — Phasen 3 bis 5 funktionieren." if ok else "\nFEHLGESCHLAGEN")
         return 0 if ok else 1
     finally:
         for p in procs:

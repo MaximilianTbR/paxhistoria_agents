@@ -44,6 +44,20 @@ async def chat(req: Request):
     system = next((m.get("content", "") for m in messages if m.get("role") == "system"), "")
     blob = json.dumps(messages, ensure_ascii=False)
 
+    # Richter-Rolle (analyze.py --judge)
+    if "verdict" in blob and "ZUSAGE von" in blob:
+        broke = "IM KRIEG" in blob or re.search(r"Beziehung zu [A-Z]{3}: -\d", blob)
+        content = json.dumps({
+            "verdict": "broken" if broke else "kept",
+            "confidence": 0.9,
+            "reason": "[stub] " + ("spaeteres Verhalten widerspricht der Zusage"
+                                   if broke else "Zusage wurde eingehalten"),
+        }, ensure_ascii=False)
+        return {"id": "stub", "object": "chat.completion", "model": body.get("model", "stub"),
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": content},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 80, "completion_tokens": 30, "total_tokens": 110}}
+
     m = re.search(r"Du bist die Staatsführung von .+? \(([A-Z]{3})\)", system)
     if m:
         country = m.group(1)
