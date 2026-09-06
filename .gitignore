@@ -4,6 +4,9 @@
 !.env.example
 *.har
 
+# Phos-Klon (via scripts/setup_phos.sh, nicht vendored)
+vendor/
+
 # Python
 __pycache__/
 *.py[cod]

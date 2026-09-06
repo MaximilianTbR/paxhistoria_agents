@@ -358,18 +358,68 @@ ist Variante 2 realistisch — auf der echten Plattform wäre sie es nicht.
 
 ---
 
-## 7. Offene Punkte für Phase 2
+## 7. Phase 2 — was daraus gebaut wurde
 
-- Fork anlegen (`actor_id`-Parametrisierung), gegen die Gegenprobe oben testen.
-- `PAX_HOST=127.0.0.1` erzwingen — das Backend ist unauthentifiziert.
-- `pax_client.py`: SSE-Parsing für `simulate`, `diplomacy/message`, `advisor/ask`
-  (drei Endpunkte streamen, der Rest ist gewöhnliches JSON).
-- Pro-Agent-Header-Injection (`X-Api-Model` je Nation) im Client vorsehen.
-- Klären, ob Agenten `/queue` + einen gemeinsamen `simulate` nutzen (alle Aktionen
-  einer Runde gleichzeitig aufgelöst) oder je einzeln `/action` (sequentiell,
-  spätere Agenten sehen die Folgen früherer). Das ist eine **Design-Entscheidung
-  mit Auswirkung auf die Ergebnisse**, kein Implementierungsdetail — simultan ist
-  näher am Diplomacy-Vorbild.
+Der Fork liegt als `patches/0001-multiseat.patch` gegen Upstream-Commit
+`f0aaa4b` vor. Phos wird bewusst **nicht** ins Repo vendored.
+
+### Was der Patch ändert
+
+| Datei | Änderung |
+|---|---|
+| `models/game.py` | `PlayerAction.acting_country_id`, `PendingAction.actor_id`, `PendingConsequence.actor_id`, `GameSession.agent_country_ids`, `CreateGameRequest.agent_country_ids`, `QueueActionRequest.acting_country_id` |
+| `services/game_engine.py` | `create_session()` nimmt Agentensitze (validiert, dedupliziert, Spieler immer zuerst); `apply_action_result_to_session()` bekommt `actor_id` — 13 Vorkommen von `session.player_country_id` durch `actor` ersetzt; `apply_simulation_unit()` nimmt eine **Liste** von Aktionsergebnissen und verteilt Weltereignis-Effekte auf **alle** Agentennationen; `_fire_pending_consequences`, `_check_stability_crisis`, `_apply_treaty_effects` arbeiten pro Sitz |
+| `routers/game.py` | `/queue` und `/action` nehmen `acting_country_id`; `/simulate` löst jede eingestellte Aktion gegen ihre eigene Nation auf; SSE-`action_result` trägt jetzt `actor_id` |
+
+Rückwärtskompatibel: Sessions ohne `agent_country_ids` (altes JSON) laden und
+fallen auf den Einzelspieler-Sitz zurück — verifiziert.
+
+### Simultaneität
+
+`/simulate` zieht vor der Auflösung einen `deepcopy` von `country_states` und löst
+**alle** Aktionen der Runde gegen diesen Vorher-Zustand auf. Keine Nation kann
+innerhalb der Runde auf den Zug einer anderen reagieren — die Voraussetzung dafür,
+dass Täuschung in Phase 5 überhaupt etwas bedeutet.
+
+Reihenfolge innerhalb einer Runde bleibt wie im Original:
+Zeit → Weltereignisse → Aktionen → Folgeereignisse → Krieg → Verträge → Wirtschaft.
+
+### Nebenbei gefixt
+
+`POST /game/{sid}/action` war upstream defekt: `process_player_action()` liefert
+ein `dict`, das Ergebnis wurde aber in `ActionResult.consequences: str` gesteckt
+(Pydantic-ValidationError), und die Deltas der Aktion wurden nie angewendet — nur
+Beziehungsänderungen. Der Patch wendet das Ergebnis vollständig an.
+
+### Verifikation ohne LLM-Kosten
+
+`scripts/smoke_multiseat.py` startet den gepatchten Server plus einen
+deterministischen Stub-Schiedsrichter (`tests/fake_referee.py`), spielt eine
+simultane Runde mit vier Nationen und prüft, dass die Deltas jeder Nation exakt
+auf dieser Nation landen:
+
+```
+[ok ] FRA: stability 74->80 (erwartet 80), rel->USA 80 (erwartet 80)
+[ok ] DEU: stability 83->75 (erwartet 75), rel->USA 60 (erwartet 60)
+[ok ] USA: stability 84->87 (erwartet 87), rel->USA 2  (erwartet 2)
+[ok ] CHN: stability 51->62 (erwartet 62), rel->USA -40 (erwartet -40)
+[ok ] jede Aktion im SSE-Stream ihrer Nation zugeordnet
+```
+
+### Offen für Phase 3/4
+
+- **Weltereignisse werden weiterhin aus der Perspektive *eines* Sitzes erzeugt**
+  (`generate_turn_events(player_country_id=…, player_nation_context=…)` nutzt den
+  nominellen Spieler). Die *Wirkung* verteilt der Patch bereits auf alle
+  Agentennationen, die *Erzeugung* ist noch spielerzentriert. Für die Auswertung
+  relevant: das kann Ereignisse leicht in Richtung des ersten Sitzes verzerren.
+  Sauber wäre, den Kontext aller Agentennationen zu übergeben.
+- `apply_simulation_unit` schreibt Aktionen **nicht** in `session.action_history`
+  (nur der `/action`-Pfad tut das). Für uns unkritisch, weil der Orchestrator in
+  Phase 4 ohnehin selbst vollständig loggt — aber man darf sich nicht auf die
+  serverseitige Historie verlassen.
+- Diplomatie zwischen unseren Agenten vermittelt der Orchestrator direkt;
+  `/diplomacy/message` würde die Engine-KI antworten lassen statt des Agenten.
 
 ## 8. Reproduktion dieser Notizen
 

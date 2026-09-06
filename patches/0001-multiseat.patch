@@ -1,0 +1,556 @@
+diff --git a/backend/app/models/game.py b/backend/app/models/game.py
+index 94f7b52..dd73448 100644
+--- a/backend/app/models/game.py
++++ b/backend/app/models/game.py
+@@ -32,6 +32,8 @@ class PlayerAction(BaseModel):
+     content: str
+     year: int
+     month: int
++    # multi-agent: which nation is acting. None = the session's nominal player.
++    acting_country_id: Optional[str] = None
+ 
+ 
+ class ActionResult(BaseModel):
+@@ -46,6 +48,8 @@ class ActionResult(BaseModel):
+ class PendingAction(BaseModel):
+     content: str
+     created_at: datetime = Field(default_factory=datetime.utcnow)
++    # multi-agent: which nation queued this. None = the session's nominal player.
++    actor_id: Optional[str] = None
+ 
+ 
+ class DomesticEvent(BaseModel):
+@@ -84,6 +88,8 @@ class Treaty(BaseModel):
+ 
+ class PendingConsequence(BaseModel):
+     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
++    # multi-agent: nation this consequence lands on. None = session's player.
++    actor_id: Optional[str] = None
+     trigger_year: int
+     trigger_month: int
+     source_action: str
+@@ -105,6 +111,9 @@ class GameSession(BaseModel):
+     scenario_id: str
+     custom_groups: List[CustomGroup] = []
+     player_country_id: str
++    # multi-agent: every nation under external (agent) control this session.
++    # Always contains player_country_id. World-event impacts apply to all of them.
++    agent_country_ids: List[str] = []
+     year: int
+     month: int
+     day: int = 1                # day within month (1-30), for sub-month simulation
+@@ -129,10 +138,13 @@ class GameSession(BaseModel):
+ class CreateGameRequest(BaseModel):
+     scenario_id: str
+     player_country_id: str
++    # multi-agent: additional nations under agent control (besides player_country_id)
++    agent_country_ids: List[str] = []
+ 
+ 
+ class QueueActionRequest(BaseModel):
+     content: str
++    acting_country_id: Optional[str] = None
+ 
+ 
+ class SimulateRequest(BaseModel):
+diff --git a/backend/app/routers/game.py b/backend/app/routers/game.py
+index 5508ca3..e9c7582 100644
+--- a/backend/app/routers/game.py
++++ b/backend/app/routers/game.py
+@@ -4,6 +4,7 @@ from app.models.game import CreateGameRequest, PlayerAction, ActionResult, Queue
+ from app.services import game_engine, ai_service
+ from app.services.scenario_loader import load_scenario
+ from app.dependencies import AiConfig, get_ai_config
++import copy
+ import json
+ 
+ router = APIRouter(prefix="/game", tags=["game"])
+@@ -12,8 +13,14 @@ router = APIRouter(prefix="/game", tags=["game"])
+ @router.post("/")
+ async def create_game(req: CreateGameRequest):
+     try:
+-        session = game_engine.create_session(req.scenario_id, req.player_country_id)
+-        return {"session_id": session.id, "message": "Partie créée avec succès"}
++        session = game_engine.create_session(
++            req.scenario_id, req.player_country_id, req.agent_country_ids
++        )
++        return {
++            "session_id": session.id,
++            "agent_country_ids": session.agent_country_ids,
++            "message": "Partie créée avec succès",
++        }
+     except ValueError as e:
+         raise HTTPException(status_code=400, detail=str(e))
+ 
+@@ -45,36 +52,53 @@ async def submit_action(
+     if not scenario:
+         raise HTTPException(status_code=404, detail="Scénario introuvable")
+ 
+-    player_country = scenario.countries.get(session.player_country_id)
+-    if not player_country:
+-        raise HTTPException(status_code=400, detail="Pays du joueur introuvable")
++    actor_id = action.acting_country_id or session.player_country_id
++    seats = session.agent_country_ids or [session.player_country_id]
++    if actor_id not in seats:
++        raise HTTPException(
++            status_code=400,
++            detail=f"{actor_id} n'est pas un siège agent de cette session : {seats}",
++        )
++
++    actor_country = scenario.countries.get(actor_id)
++    if not actor_country:
++        raise HTTPException(status_code=400, detail="Pays introuvable")
+ 
+-    player_state = session.country_states.get(session.player_country_id, {})
+-    player_country_data = game_engine.merge_country(player_country, player_state)
+-    consequences = await ai_service.process_player_action(
+-        player_country=player_country_data,
++    actor_state = session.country_states.get(actor_id, {})
++    actor_country_data = game_engine.merge_country(actor_country, actor_state)
++    result_data = await ai_service.process_player_action(
++        player_country=actor_country_data,
+         action=action.content,
+         year=session.year,
+         month=session.month,
+         world_state=session.country_states,
+         config=config,
+-        player_country_state=player_state,
++        player_country_state=actor_state,
+     )
+ 
+-    result = ActionResult(
+-        action=action.content,
+-        consequences=consequences,
+-        year=session.year,
+-        month=session.month,
++    # process_player_action returns a structured dict; apply it in full so the
++    # action's deltas actually land on the acting nation.
++    action_result = {"action": action.content, "actor_id": actor_id, **result_data}
++    game_engine.apply_action_result_to_session(
++        session, action_result, save=True, actor_id=actor_id
++    )
++    game_engine.apply_action_result(
++        session_id,
++        ActionResult(
++            action=action.content,
++            consequences=result_data.get("narrative", ""),
++            year=session.year,
++            month=session.month,
++        ),
++        actor_id=actor_id,
+     )
+-    game_engine.apply_action_result(session_id, result)
+-    return result.model_dump(mode="json")
++    return action_result
+ 
+ 
+ @router.post("/{session_id}/queue")
+ async def queue_action(session_id: str, req: QueueActionRequest):
+     try:
+-        queue = game_engine.queue_action(session_id, req.content)
++        queue = game_engine.queue_action(session_id, req.content, req.acting_country_id)
+         return {"queue": queue}
+     except ValueError as e:
+         raise HTTPException(status_code=404, detail=str(e))
+@@ -126,8 +150,12 @@ async def simulate(
+     if not player_country:
+         raise HTTPException(status_code=400, detail="Pays introuvable")
+ 
+-    # Snapshot the pending actions queue and clear it
+-    pending = [a.content for a in session.pending_actions]
++    # Snapshot the pending actions queue and clear it.
++    # Multi-agent: each entry keeps the nation that queued it.
++    pending = [
++        {"content": a.content, "actor_id": a.actor_id or session.player_country_id}
++        for a in session.pending_actions
++    ]
+     session.pending_actions = []
+ 
+     total_units = req.total_units
+@@ -172,8 +200,12 @@ async def simulate(
+                 events = []
+                 yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+ 
+-            # Process ALL actions queued for this unit
++            # Process ALL actions queued for this unit.
++            # Simultaneous mode: every agent's action for the round is resolved
++            # against the SAME pre-action world state, so nobody can react to a
++            # rival's move within the round.
+             unit_actions = actions_by_unit.get(unit_i, [])
++            world_snapshot = copy.deepcopy(session.country_states)
+             # Build recent diplomacy context from session history (last 4 exchanges)
+             recent_diplomacy = [
+                 {"player": m.content, "response": m.response or ""}
+@@ -181,24 +213,36 @@ async def simulate(
+             ]
+ 
+             action_results = []
+-            for action_content in unit_actions:
++            for queued in unit_actions:
++                action_content = queued["content"]
++                actor_id = queued["actor_id"]
+                 try:
+-                    pcs = session.country_states.get(session.player_country_id, {})
+-                    player_country_data = game_engine.merge_country(player_country, pcs)
++                    pcs = world_snapshot.get(actor_id, {})
++                    actor_base = (scenario.countries.get(actor_id)
++                                  or session.dynamic_countries.get(actor_id))
++                    if actor_base is None:
++                        raise ValueError(f"Pays introuvable : {actor_id}")
++                    if isinstance(actor_base, dict):
++                        from app.models.scenario import Country as ScenarioCountry
++                        actor_base = ScenarioCountry(**actor_base)
++                    player_country_data = game_engine.merge_country(actor_base, pcs)
+                     result_data = await ai_service.process_player_action(
+                         player_country=player_country_data,
+                         action=action_content,
+                         year=session.year,
+                         month=session.month,
+-                        world_state=session.country_states,
++                        world_state=world_snapshot,
+                         config=config,
+                         recent_diplomacy=recent_diplomacy,
+                         player_country_state=pcs,
+                     )
+-                    action_results.append({"action": action_content, **result_data})
++                    action_results.append(
++                        {"action": action_content, "actor_id": actor_id, **result_data}
++                    )
+                 except Exception as e:
+                     action_results.append({
+                         "action": action_content,
++                        "actor_id": actor_id,
+                         "narrative": str(e),
+                         "applicable": True,
+                         "relation_changes": {},
+@@ -215,15 +259,14 @@ async def simulate(
+             dom_idx = len(session.domestic_events)
+             poi_idx = len(session.map_pois)
+ 
+-            # Advance time + apply first action (if any) + war + treaties + economy
+-            first_action = action_results[0] if action_results else None
+-            game_engine.apply_simulation_unit(session, first_action, events, days=unit_days, scale=scale)
+-
+-            # Apply additional actions (same unit, no time advancement)
+-            for extra_ar in action_results[1:]:
+-                game_engine.apply_action_result_to_session(session, extra_ar, save=False, scale=scale)
+-            if len(action_results) > 1:
+-                game_engine._save_session(session)
++            # Advance time + apply ALL actions of this unit + war + treaties + economy.
++            # Every action carries its own actor_id, so each nation's deltas land
++            # on that nation. Passing them as one list keeps the original ordering
++            # (events -> actions -> consequences -> war -> treaties -> economy).
++            game_engine.apply_simulation_unit(
++                session, action_results or None, events, days=unit_days, scale=scale
++            )
++            game_engine._save_session(session)
+ 
+             new_domestic = session.domestic_events[dom_idx:]
+             new_pois = session.map_pois[poi_idx:]
+@@ -259,7 +302,7 @@ async def simulate(
+ 
+             for ar in action_results:
+                 if ar.get("applicable", True):
+-                    ar_payload = {'type': 'action_result', 'action': ar['action'], 'narrative': ar.get('narrative', ''), 'relation_changes': ar.get('relation_changes', {}), 'stability_delta': ar.get('stability_delta', 0), 'economy_delta': ar.get('economy_delta', 0.0), 'military_delta': ar.get('military_delta', 0.0), 'stat_deltas': ar.get('stat_deltas', {}), 'equipment_changes': ar.get('equipment_changes', {})}
++                    ar_payload = {'type': 'action_result', 'action': ar['action'], 'actor_id': ar.get('actor_id'), 'narrative': ar.get('narrative', ''), 'relation_changes': ar.get('relation_changes', {}), 'stability_delta': ar.get('stability_delta', 0), 'economy_delta': ar.get('economy_delta', 0.0), 'military_delta': ar.get('military_delta', 0.0), 'stat_deltas': ar.get('stat_deltas', {}), 'equipment_changes': ar.get('equipment_changes', {})}
+                     yield f"data: {json.dumps(ar_payload)}\n\n"
+ 
+             for de in new_domestic:
+diff --git a/backend/app/services/game_engine.py b/backend/app/services/game_engine.py
+index e414895..4396f09 100644
+--- a/backend/app/services/game_engine.py
++++ b/backend/app/services/game_engine.py
+@@ -63,13 +63,22 @@ def _load_session_from_disk(session_id: str) -> Optional[GameSession]:
+ 
+ # ─── API publique ───────────────────────────────────────────────────────────────
+ 
+-def create_session(scenario_id: str, player_country_id: str) -> GameSession:
++def create_session(scenario_id: str, player_country_id: str,
++                   agent_country_ids: list[str] | None = None) -> GameSession:
+     scenario = load_scenario(scenario_id)
+     if not scenario:
+         raise ValueError(f"Scénario introuvable : {scenario_id}")
+     if player_country_id not in scenario.countries:
+         raise ValueError(f"Pays introuvable dans le scénario : {player_country_id}")
+ 
++    # Multi-agent seats: player is always one of them, order preserved, deduped.
++    seats = [player_country_id] + [c for c in (agent_country_ids or [])]
++    seen: set = set()
++    seats = [c for c in seats if not (c in seen or seen.add(c))]
++    for cid in seats:
++        if cid not in scenario.countries:
++            raise ValueError(f"Pays introuvable dans le scénario : {cid}")
++
+     country_states: Dict[str, dict] = {}
+     for cid, country in scenario.countries.items():
+         country_states[cid] = {
+@@ -97,6 +106,7 @@ def create_session(scenario_id: str, player_country_id: str) -> GameSession:
+     session = GameSession(
+         scenario_id=scenario_id,
+         player_country_id=player_country_id,
++        agent_country_ids=seats,
+         year=scenario.start_year,
+         month=scenario.start_month,
+         country_states=country_states,
+@@ -158,6 +168,7 @@ def get_game_state(session_id: str) -> Optional[dict]:
+         "month": session.month,
+         "turn": session.turn,
+         "player_country": merge_country(player_country, player_state),
++        "agent_country_ids": list(session.agent_country_ids or [session.player_country_id]),
+         "countries": countries,
+         "alliances": {k: v.model_dump() for k, v in scenario.alliances.items()},
+         "custom_groups": [g.model_dump(mode="json") for g in session.custom_groups],
+@@ -175,7 +186,7 @@ def get_game_state(session_id: str) -> Optional[dict]:
+     }
+ 
+ 
+-def apply_action_result(session_id: str, result: ActionResult):
++def apply_action_result(session_id: str, result: ActionResult, actor_id: str | None = None):
+     session = get_session(session_id)
+     if not session:
+         return
+@@ -187,12 +198,12 @@ def apply_action_result(session_id: str, result: ActionResult):
+     _save_session(session)
+ 
+ 
+-def queue_action(session_id: str, content: str) -> list:
++def queue_action(session_id: str, content: str, actor_id: str | None = None) -> list:
+     from app.models.game import PendingAction
+     session = get_session(session_id)
+     if not session:
+         raise ValueError("Session introuvable")
+-    session.pending_actions.append(PendingAction(content=content))
++    session.pending_actions.append(PendingAction(content=content, actor_id=actor_id))
+     session.updated_at = datetime.utcnow()
+     _save_session(session)
+     return [a.model_dump(mode="json") for a in session.pending_actions]
+@@ -209,8 +220,14 @@ def remove_queued_action(session_id: str, index: int) -> list:
+     return [a.model_dump(mode="json") for a in session.pending_actions]
+ 
+ 
+-def apply_action_result_to_session(session: GameSession, action_result: dict, save: bool = True, scale: float = 1.0):
+-    """Apply one action's deltas to session state without advancing the month."""
++def apply_action_result_to_session(session: GameSession, action_result: dict, save: bool = True,
++                                   scale: float = 1.0, actor_id: str | None = None):
++    """Apply one action's deltas to session state without advancing the month.
++
++    actor_id selects which nation the action belongs to; None keeps the historical
++    single-player behaviour (the session's nominal player).
++    """
++    actor = actor_id or action_result.get("actor_id") or session.player_country_id
+     from app.models.game import ActionResult, DomesticEvent, MapPOI
+ 
+     result = ActionResult(
+@@ -222,16 +239,16 @@ def apply_action_result_to_session(session: GameSession, action_result: dict, sa
+     )
+     _apply_relation_changes(session, result.relation_changes)
+ 
+-    player_state = session.country_states.get(session.player_country_id, {})
++    player_state = session.country_states.get(actor, {})
+     stab = player_state.get("stability", 50) + action_result.get("stability_delta", 0) * scale
+     player_state["stability"] = max(0, min(100, round(stab)))
+     mil = player_state.get("military_modifier", 1.0) * (1 + action_result.get("military_delta", 0.0) * scale)
+     player_state["military_modifier"] = round(mil, 4)
+-    session.country_states[session.player_country_id] = player_state
++    session.country_states[actor] = player_state
+ 
+     economy_delta = action_result.get("economy_delta", 0.0)
+     if economy_delta:
+-        _apply_economy_delta(session, session.player_country_id, economy_delta, scale=scale)
++        _apply_economy_delta(session, actor, economy_delta, scale=scale)
+ 
+     for de_data in action_result.get("domestic_events", []):
+         if not isinstance(de_data, dict) or not de_data.get("title"):
+@@ -246,33 +263,33 @@ def apply_action_result_to_session(session: GameSession, action_result: dict, sa
+             month=session.month,
+         )
+         session.domestic_events.append(de)
+-        ps = session.country_states.get(session.player_country_id, {})
++        ps = session.country_states.get(actor, {})
+         s = ps.get("stability", 50) + de_data.get("stability_impact", 0)
+         ps["stability"] = max(0, min(100, round(s)))
+-        session.country_states[session.player_country_id] = ps
++        session.country_states[actor] = ps
+ 
+     stat_deltas = action_result.get("stat_deltas", {})
+     if stat_deltas:
+         scenario = load_scenario(session.scenario_id)
+-        base_country = scenario.countries.get(session.player_country_id) if scenario else None
++        base_country = scenario.countries.get(actor) if scenario else None
+         base_ns = (base_country.national_stats.model_dump() if base_country and base_country.national_stats
+                    else {"sovereignty": 50, "food_autonomy": 50, "energy_autonomy": 50, "economic_independence": 50, "security": 50})
+-        ps = session.country_states.get(session.player_country_id, {})
++        ps = session.country_states.get(actor, {})
+         current_ns = ps.get("national_stats") or dict(base_ns)
+         for key in ("sovereignty", "food_autonomy", "energy_autonomy", "economic_independence", "security"):
+             delta = stat_deltas.get(key, 0)
+             if delta:
+                 current_ns[key] = round(max(0, min(120, current_ns.get(key, base_ns.get(key, 50)) + delta)), 1)
+         ps["national_stats"] = current_ns
+-        session.country_states[session.player_country_id] = ps
++        session.country_states[actor] = ps
+ 
+     equipment_changes = action_result.get("equipment_changes", {})
+     if equipment_changes:
+         scenario = load_scenario(session.scenario_id)
+-        base_country = scenario.countries.get(session.player_country_id) if scenario else None
++        base_country = scenario.countries.get(actor) if scenario else None
+         base_eq = (base_country.military.equipment if base_country and base_country.military and base_country.military.equipment
+                    else {})
+-        ps = session.country_states.get(session.player_country_id, {})
++        ps = session.country_states.get(actor, {})
+         current_eq = ps.get("equipment")
+         if current_eq is None:
+             current_eq = dict(base_eq) if base_eq else {}
+@@ -280,14 +297,14 @@ def apply_action_result_to_session(session: GameSession, action_result: dict, sa
+             if delta:
+                 current_eq[key] = max(0, current_eq.get(key, 0) + delta)
+         ps["equipment"] = current_eq
+-        session.country_states[session.player_country_id] = ps
++        session.country_states[actor] = ps
+ 
+     poi_data = action_result.get("map_poi")
+     if poi_data and action_result.get("applicable", True) and isinstance(poi_data, dict) and poi_data.get("name"):
+         poi = MapPOI(
+             name=poi_data["name"],
+             type=poi_data["type"],
+-            country_id=session.player_country_id,
++            country_id=actor,
+             coordinates=poi_data["coordinates"],
+             icon=poi_data.get("icon", "📍"),
+             year=session.year,
+@@ -303,6 +320,7 @@ def apply_action_result_to_session(session: GameSession, action_result: dict, sa
+         trig_year = session.year + (trig_month - 1) // 12
+         trig_month = ((trig_month - 1) % 12) + 1
+         session.pending_consequences.append(PendingConsequence(
++            actor_id=actor,
+             trigger_year=trig_year,
+             trigger_month=trig_month,
+             source_action=action_result.get("action", ""),
+@@ -320,12 +338,17 @@ def apply_action_result_to_session(session: GameSession, action_result: dict, sa
+ 
+ def apply_simulation_unit(
+     session: GameSession,
+-    action_result: dict | None,
++    action_result: dict | list | None,
+     events: list,
+     days: int = 30,
+     scale: float = 1.0,
+ ):
+-    """Advance time by `days`, apply world events + optional action, war, treaties, economy, pending consequences. Saves."""
++    """Advance time by `days`, apply world events + action(s), war, treaties, economy, pending consequences. Saves.
++
++    `action_result` accepts a single dict (historical single-player behaviour) or a
++    list of dicts for multi-agent rounds. Each dict may carry an "actor_id" naming
++    the nation it belongs to; without one it falls back to the session's player.
++    """
+     from app.models.game import WorldEvent
+ 
+     # Advance day/month/year
+@@ -339,7 +362,9 @@ def apply_simulation_unit(
+     session.day = day
+     session.turn += 1
+ 
+-    player_id = session.player_country_id
++    # Multi-agent: world-event impacts land on every agent-controlled nation,
++    # not just the nominal player seat.
++    impact_ids = list(session.agent_country_ids or [session.player_country_id])
+     for e in events:
+         event = WorldEvent(
+             title=e.get("title", "Événement mondial"),
+@@ -355,17 +380,23 @@ def apply_simulation_unit(
+         )
+         session.world_events.append(event)
+         _apply_relation_changes(session, event.relation_changes)
+-        # Apply direct stability/economy impacts if the player is affected
+-        if player_id in event.affected_countries:
++        # Apply direct stability/economy impacts to each affected agent nation
++        for aid in impact_ids:
++            if aid not in event.affected_countries:
++                continue
+             if event.stability_impact:
+-                ps = session.country_states.get(player_id, {})
++                ps = session.country_states.get(aid, {})
+                 ps["stability"] = max(0, min(100, round(ps.get("stability", 50) + event.stability_impact)))
+-                session.country_states[player_id] = ps
++                session.country_states[aid] = ps
+             if event.economy_impact:
+-                _apply_economy_delta(session, player_id, event.economy_impact, scale=scale)
++                _apply_economy_delta(session, aid, event.economy_impact, scale=scale)
+ 
+     if action_result:
+-        apply_action_result_to_session(session, action_result, save=False, scale=scale)
++        results = action_result if isinstance(action_result, list) else [action_result]
++        for ar in results:
++            apply_action_result_to_session(
++                session, ar, save=False, scale=scale, actor_id=ar.get("actor_id")
++            )
+ 
+     _fire_pending_consequences(session)
+     _check_stability_crisis(session)
+@@ -560,9 +591,11 @@ def _apply_economy_delta(session: GameSession, country_id: str, delta: float, sc
+ 
+ def _apply_treaty_effects(session: GameSession) -> None:
+     """Apply monthly economy and relation bonuses from active treaties."""
+-    player_id = session.player_country_id
++    agent_ids = set(session.agent_country_ids or [session.player_country_id])
+     for treaty in session.treaties:
+-        involves_player = treaty.country_a == player_id or treaty.country_b == player_id
++        player_id = (treaty.country_a if treaty.country_a in agent_ids
++                     else treaty.country_b if treaty.country_b in agent_ids else None)
++        involves_player = player_id is not None
+         if treaty.economy_bonus and involves_player:
+             ps = session.country_states.get(player_id, {})
+             ps["economy_modifier"] = round(ps.get("economy_modifier", 1.0) * (1 + treaty.economy_bonus / 12), 6)
+@@ -751,30 +784,36 @@ def _fire_pending_consequences(session: GameSession) -> None:
+     for pc in session.pending_consequences:
+         if (session.year, session.month) >= (pc.trigger_year, pc.trigger_month):
+             from app.models.game import WorldEvent
++            pc_actor = pc.actor_id or session.player_country_id
+             session.world_events.append(WorldEvent(
+                 title=pc.title,
+                 description=pc.description,
+-                affected_countries=[session.player_country_id],
++                affected_countries=[pc_actor],
+                 year=session.year,
+                 month=session.month,
+                 type=pc.event_type,
+                 triggered_by_player=True,
+             ))
+             if pc.stability_impact:
+-                ps = session.country_states.get(session.player_country_id, {})
++                ps = session.country_states.get(pc_actor, {})
+                 ps["stability"] = max(0, min(100, round(ps.get("stability", 50) + pc.stability_impact)))
+-                session.country_states[session.player_country_id] = ps
++                session.country_states[pc_actor] = ps
+             if pc.economy_impact:
+-                _apply_economy_delta(session, session.player_country_id, pc.economy_impact)
++                _apply_economy_delta(session, pc_actor, pc.economy_impact)
+             fired_ids.append(pc.id)
+ 
+     session.pending_consequences = [pc for pc in session.pending_consequences if pc.id not in fired_ids]
+ 
+ 
+ def _check_stability_crisis(session: GameSession) -> None:
+-    """Trigger a coup/crisis event if stability falls below 10."""
++    """Trigger a coup/crisis event for any agent nation whose stability falls below 10."""
++    for _aid in list(session.agent_country_ids or [session.player_country_id]):
++        _check_stability_crisis_for(session, _aid)
++
++
++def _check_stability_crisis_for(session: GameSession, actor: str) -> None:
+     import random
+-    ps = session.country_states.get(session.player_country_id, {})
++    ps = session.country_states.get(actor, {})
+     if ps.get("stability", 50) >= 10:
+         return
+     if random.random() > 0.6:
+@@ -794,7 +833,7 @@ def _check_stability_crisis(session: GameSession) -> None:
+         month=session.month,
+     ))
+     ps["stability"] = max(0, round(ps.get("stability", 0)) - 10)
+-    session.country_states[session.player_country_id] = ps
++    session.country_states[actor] = ps
+ 
+ 
+ # ─── Régions ────────────────────────────────────────────────────────────────────
