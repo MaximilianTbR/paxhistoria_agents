@@ -40,6 +40,71 @@ def load_dotenv(path: Path) -> None:
         os.environ.setdefault(k.strip(), v.strip())
 
 
+def preflight(api_key: str, models: list[str], base_url: str) -> int:
+    """Prueft Key und Modell-IDs, bevor eine Partie Tokens verbrennt.
+
+    Falsche Modell-IDs sind der wahrscheinlichste Grund, warum ein erster Lauf
+    scheitert — und ohne diese Pruefung faellt das erst mitten in Runde 1 auf,
+    nachdem der Rest schon bezahlt ist.
+    """
+    import httpx
+
+    base = base_url.rstrip("/")
+    with httpx.Client(timeout=30) as http:
+        # 1. Key gueltig? Gleichzeitig Guthaben und Rate-Limit ablesen.
+        try:
+            r = http.get(f"{base}/key", headers={"Authorization": f"Bearer {api_key}"})
+        except httpx.HTTPError as exc:
+            print(f"FEHLER: {base} nicht erreichbar — {exc}", file=sys.stderr)
+            return 1
+        if r.status_code == 401:
+            print("FEHLER: Key wird abgelehnt (401). Neu anlegen unter "
+                  "https://openrouter.ai/settings/keys", file=sys.stderr)
+            return 1
+        if r.status_code >= 400:
+            print(f"FEHLER: /key → HTTP {r.status_code}: {r.text[:200]}", file=sys.stderr)
+            return 1
+
+        data = (r.json() or {}).get("data") or {}
+        usage, limit = data.get("usage"), data.get("limit")
+        print("Key gültig.")
+        print(f"  verbraucht : {usage}")
+        print(f"  Limit      : {limit if limit is not None else 'keins gesetzt'}")
+        if data.get("is_free_tier"):
+            print("  HINWEIS: Free-Tier — ohne Guthaben laufen nur Modelle mit :free-Suffix.")
+        if limit is not None and usage is not None and limit - usage <= 0:
+            print("  WARNUNG: Guthaben aufgebraucht.", file=sys.stderr)
+
+        # 2. Existieren die angeforderten Modelle wirklich?
+        try:
+            mr = http.get(f"{base}/models")
+            mr.raise_for_status()
+            available = {m["id"] for m in (mr.json() or {}).get("data", [])}
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            print(f"  Modell-Liste nicht abrufbar ({exc}) — IDs ungeprüft.", file=sys.stderr)
+            return 0
+
+    print(f"\nModelle ({len(available)} bei OpenRouter verfügbar):")
+    missing = []
+    for m in models:
+        if m in available:
+            print(f"  ok    {m}")
+        else:
+            missing.append(m)
+            near = sorted(a for a in available
+                          if a.split("/")[0] == m.split("/")[0])[:6]
+            print(f"  FEHLT {m}")
+            if near:
+                print(f"        vorhanden bei {m.split('/')[0]}/: {', '.join(near)}")
+
+    if missing:
+        print(f"\n{len(missing)} Modell-ID(en) existieren nicht. Mit --seat bzw. "
+              "--referee korrigieren.", file=sys.stderr)
+        return 1
+    print("\nAlles bereit. Partie starten ohne --check.")
+    return 0
+
+
 def parse_seat(spec: str) -> tuple[str, str]:
     if "=" not in spec:
         raise argparse.ArgumentTypeError(
@@ -65,6 +130,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--sequential", action="store_true",
                    help="Agenten nacheinander befragen statt parallel (langsamer, gleiches Ergebnis)")
     p.add_argument("--notes", default="", help="Freitext, landet im Protokoll")
+    p.add_argument("--check", action="store_true",
+                   help="nur Key und Modell-IDs prüfen, keine Partie spielen")
+    p.add_argument("--api-url", default="https://openrouter.ai/api/v1",
+                   help="OpenRouter-Basis-URL (für Tests umbiegbar)")
     args = p.parse_args(argv)
 
     load_dotenv(Path(__file__).parent / ".env")
@@ -75,6 +144,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     seats = args.seat or DEFAULT_SEATS
+
+    if args.check:
+        return preflight(key, [m for _, m in seats] + [args.referee], args.api_url)
+
     if len(seats) < 2:
         print("Mindestens zwei Sitze noetig — sonst gibt es nichts zu messen.", file=sys.stderr)
         return 2

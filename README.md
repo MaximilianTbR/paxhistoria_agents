@@ -48,10 +48,17 @@ Für einen echten Lauf:
 
 ```bash
 cp .env.example .env                # OPENROUTER_API_KEY eintragen
+python3 run_game.py --check         # Key + Modell-IDs prüfen, bevor es Geld kostet
 cd vendor/phos/backend && PAX_HOST=127.0.0.1 python3 -m uvicorn app.main:app --port 8000 &
-python3 run_game.py --rounds 8
+python3 run_game.py --rounds 3      # erst kalibrieren, usage steht im Protokoll
 python3 analyze.py runs/            # Auswertung
 ```
+
+`--check` validiert den Key und prüft jede Modell-ID gegen OpenRouters Liste.
+Falsche IDs sind der wahrscheinlichste Grund, warum ein erster Lauf scheitert —
+ohne die Prüfung fällt das erst mitten in Runde 1 auf, wenn der Rest schon
+bezahlt ist. Schlägt eine ID fehl, nennt der Preflight vorhandene IDs
+desselben Anbieters.
 
 Sitze frei belegen:
 

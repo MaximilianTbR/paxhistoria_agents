@@ -37,6 +37,23 @@ def _agent_reply(country: str, others: list[str]) -> dict:
     }
 
 
+# OpenRouter-Kontoendpunkte, damit der Preflight aus run_game.py testbar ist
+@app.get("/key")
+async def key_info():
+    return {"data": {"label": "stub", "usage": 1.25, "limit": 10.0,
+                     "is_free_tier": False, "rate_limit": {"requests": 10,
+                                                           "interval": "10s"}}}
+
+
+@app.get("/models")
+async def models():
+    return {"data": [{"id": i} for i in (
+        "openai/gpt-5", "openai/gpt-5-mini",
+        "anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.5",
+        "google/gemini-2.5-pro", "deepseek/deepseek-chat",
+    )]}
+
+
 @app.post("/chat/completions")
 async def chat(req: Request):
     body = await req.json()
