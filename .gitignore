@@ -1,0 +1,22 @@
+# Secrets — niemals committen
+.env
+.env.*
+!.env.example
+*.har
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Spiel-Logs / Auswertung
+logs/
+runs/
+*.ipynb_checkpoints
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
